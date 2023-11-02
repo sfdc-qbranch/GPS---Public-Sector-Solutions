@@ -1,0 +1,18 @@
+{
+    "cSpell.words": [
+        "cumulusci",
+        "robotframework",
+        "qbrix"
+    ],
+    "robot.pythonpath": [
+        "${workspaceFolder}",
+        "${workspaceFolder}/qbrix",
+        "${workspaceFolder}/qbrix/robot",
+        "${workspaceFolder}/robot",
+        "${workspaceFolder}/qbrix_local",
+    ],
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.black-formatter"
+    },
+    "workbench.colorCustomizations": {}
+}

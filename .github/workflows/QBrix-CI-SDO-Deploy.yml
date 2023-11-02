@@ -1,0 +1,501 @@
+name: QBRrix-CI-SDO-Deploy
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+  workflow_dispatch:
+env:
+  CUMULUSCI_KEYCHAIN_CLASS: cumulusci.core.keychain.EnvironmentProjectKeychain
+  CUMULUSCI_SERVICE_github: ${{ secrets.QBRIX_CUMULUSCI_SERVICE_github }}
+  SFDX_CLIENT_ID: ${{ secrets.QBRIX_DEVHUB_CONSUMER_KEY }}
+  SFDX_HUB_KEY: ${{ secrets.QBRIX_DEVHUB_PRIVATE_KEY }}
+  DEVHUBCONSUMERKEY: ${{ secrets.QBRIX_DEVHUB_CONSUMER_KEY }}
+  DEVHUBJWTKEYFILE: devhub.key
+  GITHUB_PAT: ${{ secrets.QBRIX_GITHUB_PAT}}
+  USE_TEMPLATE: true
+  TEMPLATEID: LATEST
+  TEMPLATE_INSTANCE: NA135
+  SFDX_DISABLE_DNS_CHECK: true
+  ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+  BUILD_SUFFIX: SDO
+  QBRIX_SYSTEM_ID: GIT_BUILD_AUTOMATION
+  SF_USE_PROGRESS_BAR: false
+  CUMULUSCI_SERVICE_metadeploy: ${{ secrets.QBRIX_CUMULUSCI_SERVICE_METADEPLOY}}
+  AUTO_PUBLISH_TO_METADEPLOY: false
+  mixpanelsignature: ${{ secrets.mixpanelsignature }}
+  mixpanelidentifier: ${{ secrets.mixpanelidentifier }}
+
+jobs:
+  collection_deployment_steps:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set ownership
+        run: |
+          # this is to fix GIT not liking owner of the checkout dir
+          chown -R $(id -u):$(id -g) $PWD
+
+      - name: Check file existence
+        id: collection_run_present
+        uses: andstor/file-existence-action@v2
+        with:
+          files: "${{ github.workspace }}/collection_run.json"
+
+      - name: create defaullt matrix
+        if: steps.collection_run_present.outputs.files_exists == 'false'
+        uses: "DamianReeves/write-file-action@master"
+        with:
+          path: ${{ github.workspace }}/collection_run.json
+          write-mode: overwrite
+          contents: |
+            [{ "action": "flow", "target": "deploy_qbrix", "description": "Deploy QBrix" }]
+
+      - uses: nelonoel/branch-name@v1.0.1
+      - id: set-matrix
+        uses: JoshuaTheMiller/conditional-build-matrix@main
+        with:
+          filter: "[*]"
+          inputFile: ${{ github.workspace }}/collection_run.json
+
+  target_org_env_build:
+    needs: [collection_deployment_steps]
+    runs-on: ubuntu-latest
+    container:
+      image: "ghcr.io/sfdc-qbranch/qbrix-base-container:latest"
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.QBRIX_CONTAINER_PUBLISH_GITHUB_PAT}}
+    outputs:
+      target-org: ${{ steps.extrattargetorg.outputs.value }}
+      target-accesstoken: ${{ steps.extrattargetaccesstoken.outputs.value }}
+      target-instanceurl: ${{ steps.extrattargetinstanceurl.outputs.value }}
+      target-auto-publish-metadeploy: ${{ steps.extractautopublishmetadeploy.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set ownership
+        run: |
+          # this is to fix GIT not liking owner of the checkout dir
+          chown -R $(id -u):$(id -g) $PWD
+
+      - name: Core Setup - key for jwt auth
+        run: echo "${{ secrets.QBRIX_DEVHUB_PRIVATE_KEY }}" > devhub.key
+
+      # We will use a common app with a common key -
+      - name: Create SFDX Session for DEV HUB ACCESS
+        run: sf org login jwt -o ${{ secrets.QBRIX_DEVHUB_USERACCOUNT }} -a DEVHUB_ACCT -d -f devhub.key -i ${{ secrets.QBRIX_DEVHUB_CONSUMER_KEY }} -s
+
+      # We will use a common app with a common key -
+      - name: Create SFDX Session for QLABS Service Account
+        run: sf org login jwt -o ${{ secrets.QBRIX_QLABS_SERVICE_ACCOUNT }} -d -f devhub.key -i ${{ secrets.QBRIX_DEVHUB_CONSUMER_KEY }}
+
+      - name: Extract the accesstoken
+        run: sf org display -o ${{ secrets.QBRIX_QLABS_SERVICE_ACCOUNT }} --json > qlab_tmp.json
+
+      - name: extract the accesstoken for qlabs
+        uses: sergeysova/jq-action@v2
+        id: qlabs_accesstoken
+        with:
+          cmd: jq '.result.accessToken' qlab_tmp.json -r
+
+      #Update the build Status to Running only on the main or master branch
+      - name: update build status to starting
+        if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: "https://qlabs-org.my.salesforce.com/services/apexrest/NGQBrixBuildService"
+          method: "POST"
+          customHeaders: '{"Content-Type": "application/json","Authorization": "Bearer ${{ steps.qlabs_accesstoken.outputs.value }}"}'
+          data: '{"github_repository_id": "${{ github.repository_id }}", "qbrixname": "${{ github.event.repository.name }}-${{ env.BUILD_SUFFIX }}", "buildstatus": "Running"}'
+          timeout: 30000
+
+      #determine if there is a template or instance override defined in qlabs for this build config
+      - name: get qlabs config settings
+        id: qlab_config_settings
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: "https://qlabs-org.my.salesforce.com/services/apexrest/NGQBrixBuildServiceProperties?workflowconfigid=QBRrix-CI-SDO-Deploy&qbrixname=${{ github.event.repository.name }}"
+          method: "GET"
+          customHeaders: '{"Content-Type": "application/json","Authorization": "Bearer ${{ steps.qlabs_accesstoken.outputs.value }}"}'
+          timeout: 30000
+
+      - name: extract qlabs config setting
+        run: |
+          echo '${{ steps.qlab_config_settings.outputs.response }}' > qlabs_settings.json
+          more qlabs_settings.json
+          echo ${{ steps.qlab_config_settings.outputs.response }}
+          echo ${{ fromJson(steps.qlab_config_settings.outputs.response).templateid }}
+          echo "::set-env name=TEMPLATEID::${{ fromJson(steps.qlab_config_settings.outputs.response).templateid }}"
+          echo "::set-env name=TEMPLATE_INSTANCE::${{ fromJson(steps.qlab_config_settings.outputs.response).template_instance }}"
+          echo "::set-env name=ORG_TARGET_USER::${{ fromJson(steps.qlab_config_settings.outputs.response).org_target_user }}"
+          echo "::set-env name=AUTO_PUBLISH_TO_METADEPLOY::${{ fromJson(steps.qlab_config_settings.outputs.response).auto_publish_metadeploy }}"
+          echo "::set-env name=GITHUB_API_SLEEP_TIME::${{ fromJson(steps.qlab_config_settings.outputs.response).github_api_reset_seconds }}"
+
+      - name: Sleep for ${{env.GITHUB_API_SLEEP_TIME}} seconds per GIT API SLEEP TIME
+        uses: juliangruber/sleep-action@v1
+        with:
+          time: ${{env.GITHUB_API_SLEEP_TIME}}s
+
+      - name: Set CCI DevHub Username
+        run: cci service connect devhub --username DEVHUB_ACCT
+
+      # CCI Service List - we should have all 3 connected now: persistant, github (via env var) and devhub
+      - name: All connected services
+        run: cci service list
+
+        # Create a scratch org to attach - future use the org pool service
+      - name: generate scratch org - if the evn variable to use a template is set to false - we fallback to org/dev.json
+        if: env.USE_TEMPLATE == 'false' && env.ORG_TARGET_USER==''
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 120
+          max_attempts: 5
+          retry_on: error
+          command: cci task run spin_request --maxwait 120 --mode SCRATCH --scratch_config ${GITHUB_WORKSPACE}/orgs/dev.json --devhubuser DEVHUB_ACCT --cciorg dev --devhubconsumerkey ${{ secrets.QBRIX_DEVHUB_CONSUMER_KEY }} --devhubjwtkeyfile devhub.key --githubpat ${{ secrets.QBRIX_GITHUB_PAT}}
+
+      - name: generate production org - if the evn variable to use a template is set to true - we connect to the devhub that is enabled to provision an org.
+        if: env.USE_TEMPLATE == 'true' && env.ORG_TARGET_USER==''
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 120
+          max_attempts: 3
+          retry_on: error
+          command: cci task run spin_request --maxwait 120 --mode TEMPLATE --cciorg dev --devhubuser DEVHUB_ACCT --instance ${TEMPLATE_INSTANCE} --devhubconsumerkey ${{ secrets.QBRIX_DEVHUB_CONSUMER_KEY }} --devhubjwtkeyfile devhub.key --templateid ${TEMPLATEID} --githubpat ${{ secrets.QBRIX_GITHUB_PAT}}
+
+      - name: The central QLabs Settings has specified dedicated org/user to run against.
+        if: env.ORG_TARGET_USER!=''
+        run: |
+          sf org login jwt -o ${{ env.ORG_TARGET_USER }} -a dev_target_username -d -f devhub.key -i ${{ secrets.QBRIX_DEVHUB_CONSUMER_KEY }}
+          cci org import ${{env.ORG_TARGET_USER}} dev
+
+      - name: export cci session data
+        run: cci org info dev --json
+
+      - name: export cci session data
+        run: cci org info dev --json > targetdev.json
+
+      - name: trim line 1 and 2
+        run: tail -n +3 targetdev.json
+
+      - name: trim line 1 and 2
+        run: tail -n +3 targetdev.json > targetorg.json
+
+      - name: extract the target user
+        uses: sergeysova/jq-action@v2
+        id: extrattargetorg
+        with:
+          cmd: jq '.username' targetorg.json -r
+
+      - name: extract the target accesstoken
+        uses: sergeysova/jq-action@v2
+        id: extrattargetaccesstoken
+        with:
+          cmd: jq '.access_token' targetorg.json -r
+
+      - name: extract the target accesstoken
+        uses: sergeysova/jq-action@v2
+        id: extrattargetinstanceurl
+        with:
+          cmd: jq '.instance_url' targetorg.json -r
+
+      - name: extract the metadeploy publish qlabs setting if we will autopublish this to metadeploy
+        uses: sergeysova/jq-action@v2
+        id: extractautopublishmetadeploy
+        with:
+          cmd: jq '.auto_publish_metadeploy' qlabs_settings.json -r
+
+      - name: set output extract metadeploy publish
+        id: loadtautopublishmetadeploy
+        run: echo "target-auto-publish-metadeploy=${{steps.extractautopublishmetadeploy.outputs.value }}" >> $GITHUB_OUTPUT
+
+      - name: set qlabs setting if we will autopublish this to metadeploy
+        id: auto_publish_metadeploy
+        run: echo "target-auto-publish-metadeploy=${AUTO_PUBLISH_TO_METADEPLOY}" >> $GITHUB_OUTPUT
+
+      - name: set output target user
+        id: loadtargetorg
+        run: echo "target-org=${{ steps.extrattargetorg.outputs.value }}" >> $GITHUB_OUTPUT
+
+      - name: set output target access token
+        id: loadtargetaccesstoken
+        run: echo "target-accesstoken=${{ steps.extrattargetaccesstoken.outputs.value }}" >> $GITHUB_OUTPUT
+
+      - name: set output target instance url
+        id: loadtargetintanceurl
+        run: echo "target-instanceurl=${{ steps.extrattargetinstanceurl.outputs.value }}" >> $GITHUB_OUTPUT
+
+      - name: fail details
+        uses: mathiasvr/command-output@v1
+        if: ${{ failure() && ( github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+        id: cci_failure_details
+        with:
+          run: |
+            cci error info | base64 -w 0
+
+      - name: fail status
+        if: ${{ failure() && ( github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: "https://qlabs-org.my.salesforce.com/services/apexrest/NGQBrixBuildService"
+          method: "POST"
+          customHeaders: '{"Content-Type": "application/json","Authorization": "Bearer ${{ steps.qlabs_accesstoken.outputs.value }}"}'
+          data: '{"github_repository_id": "${{ github.repository_id }}", "qbrixname": "${{ github.repository }}-${{ env.BUILD_SUFFIX }}", "buildstatus": "Failed", "details": "${{ steps.cci_failure_details.outputs.stdout }}" }'
+          timeout: 30000
+
+  qbrix_deployments:
+    needs: [collection_deployment_steps, target_org_env_build]
+    runs-on: ubuntu-latest
+    container:
+      image: "ghcr.io/sfdc-qbranch/qbrix-base-container:latest"
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.QBRIX_CONTAINER_PUBLISH_GITHUB_PAT}}
+    strategy:
+      matrix: ${{ fromJSON(needs.collection_deployment_steps.outputs.matrix) }}
+      max-parallel: 1 #run in sequence
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set ownership
+        run: |
+          # this is to fix GIT not liking owner of the checkout dir
+          chown -R $(id -u):$(id -g) $PWD
+
+      - name: Core Setup - key for jwt auth
+        run: echo "${{ secrets.QBRIX_DEVHUB_PRIVATE_KEY }}" > devhub.key
+
+      - name: Import the target username via SFDX
+        run: export SFDX_ACCESS_TOKEN='${{ needs.target_org_env_build.outputs.target-accesstoken }}' && sf org login access-token --instance-url ${{ needs.target_org_env_build.outputs.target-instanceurl }} -a ${{ needs.target_org_env_build.outputs.target-org }} --no-prompt --json
+
+      # We will use a common app with a common key -
+      - name: Create SFDX Session for DEV HUB ACCESS
+        run: sf org login jwt -o ${{ secrets.QBRIX_DEVHUB_USERACCOUNT }} -a DEVHUB_ACCT -d -f devhub.key -i ${{ secrets.QBRIX_DEVHUB_CONSUMER_KEY }} -s
+
+      # We will use a common app with a common key -
+      - name: Create SFDX Session for QLABS Service Account
+        run: sf org login jwt -o ${{ secrets.QBRIX_QLABS_SERVICE_ACCOUNT }} -d -f devhub.key -i ${{ secrets.QBRIX_DEVHUB_CONSUMER_KEY }}
+
+      - name: Extract the accesstoken
+        run: sf org display -o ${{ secrets.QBRIX_QLABS_SERVICE_ACCOUNT }} --json > qlab_tmp.json
+
+      - name: extract the accesstoken for qlabs
+        uses: sergeysova/jq-action@v2
+        id: qlabs_accesstoken
+        with:
+          cmd: jq '.result.accessToken' qlab_tmp.json -r
+
+      - name: Set CCI DevHub Username
+        run: cci service connect devhub --username DEVHUB_ACCT
+
+      - name: force an update
+        run: cci task run update_qbrix --SkipDependencyChecks True
+
+      - name: rfbrowser init setup
+        run: rfbrowser init
+
+      # CCI Service List - we should have all 3 connected now: persistant, github (via env var) and devhub
+      - name: All connected services
+        run: cci service list
+
+      - name: Import the target username into the cci runtime step
+        run: cci org import ${{ needs.target_org_env_build.outputs.target-org }} dev
+
+      - name: Make sure session is valid
+        run: cci org info dev
+
+      - name: Running ${{ matrix.description }} ${{ matrix.action }}::${{ matrix.target }}
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 1440
+          retry_on: error
+          max_attempts: 2
+          command: cci ${{ matrix.action }} run ${{ matrix.target }}  --org dev
+          on_retry_command: cci error info
+
+      - name: fail details
+        uses: mathiasvr/command-output@v1
+        if: ${{ failure() && ( github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+        id: cci_failure_details
+        with:
+          run: |
+            cci error info | base64 -w 0
+
+      - name: fail status
+        if: ${{ failure() && ( github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: "https://qlabs-org.my.salesforce.com/services/apexrest/NGQBrixBuildService"
+          method: "POST"
+          customHeaders: '{"Content-Type": "application/json","Authorization": "Bearer ${{ steps.qlabs_accesstoken.outputs.value }}"}'
+          data: '{"github_repository_id": "${{ github.repository_id }}", "qbrixname": "${{ github.repository }}-${{ env.BUILD_SUFFIX }}", "buildstatus": "Failed", "details": "${{ steps.cci_failure_details.outputs.stdout }}" }'
+          timeout: 30000
+
+  qbrix_metadeploy_publish:
+    needs: [qbrix_deployments, target_org_env_build]
+    runs-on: ubuntu-latest
+    container:
+      image: "ghcr.io/sfdc-qbranch/qbrix-base-container:latest"
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.QBRIX_CONTAINER_PUBLISH_GITHUB_PAT}}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set ownership
+        run: |
+          # this is to fix GIT not liking owner of the checkout dir
+          chown -R $(id -u):$(id -g) $PWD
+
+      #display cci version
+      - name: cci version
+        if: (needs.target_org_env_build.outputs.target-auto-publish-metadeploy == 'true' && ( github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
+        run: cci version
+
+      #CCI Service List
+      - name: cci service list
+        if: (needs.target_org_env_build.outputs.target-auto-publish-metadeploy == 'true' && ( github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
+        run: cci service list
+
+      - name: metadeploy publish - if applicable
+        if: (needs.target_org_env_build.outputs.target-auto-publish-metadeploy == 'true' && ( github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
+        continue-on-error: true
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 5
+          retry_on: error
+          max_attempts: 1
+          command: SHORTSHA=$(git rev-parse --short HEAD ) && cci task run metadeploy_publish --commit $SHORTSHA --publish True
+          on_retry_command: cci error info
+
+  qbrix_build_validate:
+    needs: [qbrix_deployments, target_org_env_build]
+    runs-on: ubuntu-latest
+    container:
+      image: "ghcr.io/sfdc-qbranch/qbrix-base-container:latest"
+      credentials:
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.QBRIX_CONTAINER_PUBLISH_GITHUB_PAT}}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set ownership
+        run: |
+          # this is to fix GIT not liking owner of the checkout dir
+          chown -R $(id -u):$(id -g) $PWD
+
+      - name: Core Setup - key for jwt auth
+        run: echo "${{ secrets.QBRIX_DEVHUB_PRIVATE_KEY }}" > devhub.key
+
+      - name: Import the target username via SFDX
+        run: export SFDX_ACCESS_TOKEN='${{ needs.target_org_env_build.outputs.target-accesstoken }}' && sf org login access-token --instance-url ${{ needs.target_org_env_build.outputs.target-instanceurl }} -a ${{ needs.target_org_env_build.outputs.target-org }} --no-prompt --json
+
+      # We will use a common app with a common key -
+      - name: Create SFDX Session for DEV HUB ACCESS
+        run: sf org login jwt -o ${{ secrets.QBRIX_DEVHUB_USERACCOUNT }} -a DEVHUB_ACCT -d -f devhub.key -i ${{ secrets.QBRIX_DEVHUB_CONSUMER_KEY }} -s
+
+      # We will use a common app with a common key -
+      - name: Create SFDX Session for QLABS Service Account
+        run: sf org login jwt -o ${{ secrets.QBRIX_QLABS_SERVICE_ACCOUNT }} -d -f devhub.key -i ${{ secrets.QBRIX_DEVHUB_CONSUMER_KEY }}
+
+      - name: Extract the accesstoken
+        run: sf org display -o ${{ secrets.QBRIX_QLABS_SERVICE_ACCOUNT }} --json > qlab_tmp.json
+
+      - name: extract the accesstoken for qlabs
+        uses: sergeysova/jq-action@v2
+        id: qlabs_accesstoken
+        with:
+          cmd: jq '.result.accessToken' qlab_tmp.json -r
+
+      - name: Set CCI DevHub Username
+        run: cci service connect devhub --username DEVHUB_ACCT
+
+      # CCI Service List - we should have all 3 connected now: persistant, github (via env var) and devhub
+      - name: All connected services
+        run: cci service list
+
+      - name: Import the target username into the cci runtime step
+        run: cci org import ${{ needs.target_org_env_build.outputs.target-org }} dev
+
+      - name: Make sure session is valid
+        run: cci org info dev
+
+      - name: run qbrix validate
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 1440
+          retry_on: error
+          max_attempts: 2
+          command: cci flow run validate_qbrix --org dev
+          on_retry_command: cci error info
+
+      - name: Check file existence
+        id: check_validationresults_present
+        uses: andstor/file-existence-action@v2
+        with:
+          files: "${{ github.workspace }}/validationresult.json"
+
+      - name: Read Validation Results file - if present
+        if: steps.check_validationresults_present.outputs.files_exists == 'true'
+        id: read_validationresults_file
+        uses: andstor/file-reader-action@v1
+        with:
+          path: "${{ github.workspace }}/validationresult.json"
+
+      - name: upload the validation results - if present
+        if: ((github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && steps.check_validationresults_present.outputs.files_exists == 'true')
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: "https://qlabs-org.my.salesforce.com/services/apexrest/NGQBrixValidationService/${{ github.repository }}-${{ env.BUILD_SUFFIX }}"
+          method: "POST"
+          customHeaders: '{"Content-Type": "application/json","Authorization": "Bearer ${{ steps.qlabs_accesstoken.outputs.value }}"}'
+          data: "${{ steps.read_validationresults_file.outputs.contents }}"
+          timeout: 30000
+
+      - name: clear existing validation results - not file present
+        if: ((github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && steps.check_validationresults_present.outputs.files_exists == 'false')
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: "https://qlabs-org.my.salesforce.com/services/apexrest/NGQBrixValidationService/${{ github.repository }}-${{ env.BUILD_SUFFIX }}"
+          method: "POST"
+          customHeaders: '{"Content-Type": "application/json","Authorization": "Bearer ${{ steps.qlabs_accesstoken.outputs.value }}"}'
+          data: '{"results":[]}'
+          timeout: 30000
+
+      # Clean up scratch orgs
+      - name: Delete the scratch Org
+        if: env.USE_TEMPLATE == 'false'
+        continue-on-error: true
+        run: cci org scratch_delete dev
+
+      - name: fail details
+        uses: mathiasvr/command-output@v1
+        if: ${{ failure() && ( github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+        id: cci_failure_details
+        with:
+          run: |
+            cci error info | base64 -w 0
+
+      - name: fail status
+        if: ${{ failure() && ( github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: "https://qlabs-org.my.salesforce.com/services/apexrest/NGQBrixBuildService"
+          method: "POST"
+          customHeaders: '{"Content-Type": "application/json","Authorization": "Bearer ${{ steps.qlabs_accesstoken.outputs.value }}"}'
+          data: '{"github_repository_id": "${{ github.repository_id }}", "qbrixname": "${{ github.repository }}-${{ env.BUILD_SUFFIX }}", "buildstatus": "Failed", "details": "${{ steps.cci_failure_details.outputs.stdout }}" }'
+          timeout: 30000
+
+      - name: success status
+        if: ${{ success() && ( github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+        uses: fjogeleit/http-request-action@v1
+        with:
+          url: "https://qlabs-org.my.salesforce.com/services/apexrest/NGQBrixBuildService"
+          method: "POST"
+          customHeaders: '{"Content-Type": "application/json","Authorization": "Bearer ${{ steps.qlabs_accesstoken.outputs.value }}"}'
+          data: '{"github_repository_id": "${{ github.repository_id }}", "qbrixname": "${{ github.repository }}-${{ env.BUILD_SUFFIX }}", "buildstatus": "Passed", "details": ""}'
+          timeout: 30000
